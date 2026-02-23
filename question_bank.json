@@ -1,0 +1,35 @@
+[
+    {
+      "id": "ALG-LIN-001",
+      "type": "mcq",
+      "domain": "Algebra",
+      "subtopic": "Linear equations in one and two variables",
+      "difficulty": 2,
+      "prompt": "Solve for x: 3x - 7 = 11",
+      "choices": ["4", "6", "7", "9"],
+      "answer": "6",
+      "explanation": "Add 7 to both sides: 3x = 18. Divide by 3: x = 6."
+    },
+    {
+      "id": "GEO-AV-001",
+      "type": "mcq",
+      "domain": "Geometry",
+      "subtopic": "Area and volume",
+      "difficulty": 2,
+      "prompt": "What is the area of the rectangle shown?",
+      "choices": ["12", "18", "24", "36"],
+      "answer": "24",
+      "explanation": "Area = length × width. From the diagram, 6 × 4 = 24.",
+      "image": "images/rectangle.png"
+    },
+    {
+      "id": "ALG-LIN-002",
+      "type": "numeric",
+      "domain": "Algebra",
+      "subtopic": "Linear equations in one variable",
+      "difficulty": 2,
+      "prompt": "Solve for x: 5x - 10 = 0. Enter your answer.",
+      "answer": "2",
+      "explanation": "Add 10 to both sides: 5x = 10. Divide by 5: x = 2."
+    }
+  ]

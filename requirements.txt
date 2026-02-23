@@ -1,0 +1,6 @@
+streamlit
+altair
+reportlab
+pandas
+vl-convert-python
+streamlit-autorefresh
