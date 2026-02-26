@@ -4,4 +4,4 @@ reportlab
 pandas
 vl-convert-python
 streamlit-autorefresh
-streamlit-autorefresh
+matplotlib
