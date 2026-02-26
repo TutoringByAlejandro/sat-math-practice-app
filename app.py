@@ -1,647 +1,796 @@
+import streamlit as st
 import json
 import random
-import re
 import time
+import io
+import os
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from fractions import Fraction
-from io import BytesIO
+from decimal import Decimal, InvalidOperation
+from streamlit_autorefresh import st_autorefresh
+import re
 
-import altair as alt
-import streamlit as st
+# PDF generation
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 
-
-# ----------------------------
-# Optional: safe timer refresh
-# ----------------------------
-try:
-    from streamlit_autorefresh import st_autorefresh  # type: ignore
-    HAS_AUTOREFRESH = True
-except Exception:
-    HAS_AUTOREFRESH = False
+# Charts
+import matplotlib.pyplot as plt
 
 
-# ----------------------------
+# ============================================================
 # Config
-# ----------------------------
-APP_TITLE = "SAT Math Practice"
-QUESTION_FILE = "question_bank.json"
+# ============================================================
+st.set_page_config(page_title="SAT Math Practice", layout="wide")
 
-
-# ----------------------------
-# Helpers: loading questions
-# ----------------------------
-@st.cache_data(show_spinner=False)
+st.markdown("""
+<style>
+div[role="radiogroup"] > label {
+    margin-bottom: 16px;
+}
+</style>
+""", unsafe_allow_html=True)
+# ============================================================
+# Load questions
+# ============================================================
+@st.cache_data
 def load_questions(path: str):
     with open(path, "r", encoding="utf-8") as f:
-        raw = f.read().strip()
-        if not raw:
-            raise ValueError("question_bank.json is empty.")
-        data = json.loads(raw)
-        if not isinstance(data, list):
-            raise ValueError("question_bank.json must be a JSON list (array) of question objects.")
-        return data
+        return json.load(f)
 
 
-def normalize_text(s: str) -> str:
-    return str(s).strip()
+# ============================================================
+# Helpers
+# ============================================================
+def normalize_choice(c):
+    """
+    Choices can be either:
+      - a string (text choice)
+      - an object: {"text": "...", "image": "images/....png"} (image or mixed choice)
+
+    Returns a dict with keys: text, image
+    """
+    if c is None:
+        return {"text": "", "image": None}
+    if isinstance(c, str):
+        return {"text": c, "image": None}
+    if isinstance(c, dict):
+        return {
+            "text": c.get("text", "") if c.get("text") is not None else "",
+            "image": c.get("image", None),
+        }
+    # fallback
+    return {"text": str(c), "image": None}
 
 
-def is_mixed_number(s: str) -> bool:
-    return re.match(r"^\s*\d+\s+\d+\s*/\s*\d+\s*$", s) is not None
+def is_choice_obj_list(choices):
+    return isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], dict)
 
 
-def parse_decimal_to_fraction(s: str) -> Fraction:
-    d = Decimal(s)
-    return Fraction(d)
+def build_choice_label(choice_obj, idx):
+    """
+    Human-readable label for radio options.
+    If it's image-only, label becomes "Option {idx+1}".
+    If it has text, use that text.
+    """
+    txt = (choice_obj.get("text") or "").strip()
+    if txt:
+        return txt
+    return f"Option {idx+1}"
 
 
-def parse_fraction_string(s: str) -> Fraction:
-    m = re.match(r"^\s*([+-]?\d+)\s*/\s*([+-]?\d+)\s*$", s)
-    if not m:
-        raise ValueError("Not a fraction")
-    num = int(m.group(1))
-    den = int(m.group(2))
-    if den == 0:
-        raise ValueError("Denominator cannot be 0")
-    return Fraction(num, den)
+def answer_matches(choice_obj, answer_value):
+    """
+    answer_value can be:
+      - text answer (string)
+      - image path answer (string)
+    We consider it a match if it equals the choice text OR equals the choice image path.
+    """
+    if answer_value is None:
+        return False
+    a = str(answer_value).strip()
+    txt = str(choice_obj.get("text") or "").strip()
+    img = str(choice_obj.get("image") or "").strip()
+    return (txt and a == txt) or (img and a == img)
 
 
-def parse_sat_numeric(user_str: str) -> Fraction | None:
-    s = normalize_text(user_str)
-    if s == "":
-        return None
-
-    if any(ch in s for ch in [",", "$", "%"]):
-        return None
-
-    if is_mixed_number(s):
-        return None
-
-    if re.match(r"^\s*\d+\s*-\s*\d+/\d+\s*$", s):
-        return None
-
-    try:
-        return parse_fraction_string(s)
-    except Exception:
-        pass
-
-    try:
-        return parse_decimal_to_fraction(s)
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def is_correct(q: dict, user_response) -> bool:
-    qtype = str(q.get("type", "mcq")).lower()
-    correct_answer = str(q.get("answer", "")).strip()
-
-    if qtype == "mcq":
-        if user_response is None:
-            return False
-        return str(user_response).strip() == correct_answer
-
-    if qtype == "numeric":
-        if user_response is None:
-            return False
-        user_str = str(user_response).strip()
-        user_val = parse_sat_numeric(user_str)
-        if user_val is None:
-            return False
-
-        ans_val = parse_sat_numeric(correct_answer)
-        if ans_val is None:
-            return user_str == correct_answer
-
-        return user_val == ans_val
-
-    return False
-
-
-def get_user_response_widget(q: dict, idx: int):
-    qtype = str(q.get("type", "mcq")).lower()
-
-    if qtype == "mcq":
-        choices = q.get("choices", None)
-        if not isinstance(choices, list) or len(choices) == 0:
-            st.error("MCQ question is missing a non-empty 'choices' list.")
-            return None
-        return st.radio("Choose one:", choices, key=f"mcq_{idx}")
-
-    if qtype == "numeric":
-        return st.text_input("Enter your answer (decimal or fraction like 3/4):", key=f"num_{idx}")
-
-    st.error(f"Unsupported question type: {qtype}")
+def find_correct_choice_index(choices, answer_value):
+    """
+    Returns index of correct choice in normalized choices list, else None.
+    """
+    for i, c in enumerate(choices):
+        if answer_matches(c, answer_value):
+            return i
     return None
 
 
-# ----------------------------
-# PDF helpers (Option B + charts)
-# ----------------------------
-def _try_make_altair_png(chart) -> bytes | None:
+def safe_image_exists(path):
+    if not path:
+        return False
+    return os.path.exists(path)
+
+
+# ============================================================
+# Question rendering
+# ============================================================
+
+
+_PLAIN_TEXT_PATTERNS = [
+    re.compile(r"^\d+\s+and\s+\d+$", re.IGNORECASE),  # "9 and 3"
+]
+
+
+
+def to_latexish(s: str) -> str:
+    s = str(s).strip()
+
+    # Units like cm^2 -> \text{cm}^{2}  (also mm^2, m^3, etc.)
+    s = re.sub(r"\b(cm|mm|m|km|in|ft)\^(\d+)\b", r"\\text{\1}^{\2}", s)
+
+    # Use \cdot instead of ·
+    s = s.replace("·", r"\cdot")
+
+    return s
+
+
+def format_for_radio_label(s: str) -> str:
+    s = str(s).strip()
+
+    # Only treat as LaTeX if it explicitly contains LaTeX commands
+    if "\\" in s:
+        clean = s.replace("$", "")
+        return f"${clean}$"
+
+    return s
+
+
+def render_mcq(q, q_index):
     """
-    Convert an Altair chart to PNG bytes using vl-convert-python.
-    Returns None if conversion deps aren't installed.
+    Renders MCQ question. Supports:
+      - question-level image q["image"]
+      - choice images if choices are objects with {"text","image"}
+    Returns (selected_value, submitted_bool)
+    where selected_value is either:
+      - choice text (if text choice) OR
+      - choice image path (if image choice) OR
+      - (for mixed) prefer text if exists else image
     """
+    st.markdown("### Question")
+    st.markdown(q["prompt"])
+    if q.get("image"):
+        # Show question image if present
+        if safe_image_exists(q["image"]):
+            st.image(q["image"], use_container_width=True)
+        else:
+            st.warning(f"Question image not found: {q['image']}")
+
+    raw_choices = q.get("choices") or []
+    choices = [normalize_choice(c) for c in raw_choices]
+
+    # Build labels for the radio widget (must be strings)
+    labels = [build_choice_label(c, i) for i, c in enumerate(choices)]
+
+    # Use stable key per question render
+    radio_key = f"mcq_choice_{q_index}_{q['id']}"
+
+    st.write("Choose one:")
+
+    
+
+    selected_label = st.radio("", labels, key=radio_key, format_func=format_for_radio_label)
+
+    # Show answer images if present (for object-based choices)
+    any_choice_images = any(bool(c.get("image")) for c in choices)
+    if any_choice_images:
+        st.caption("Answer choice images:")
+        cols = st.columns(2)
+        for i, c in enumerate(choices):
+            img = c.get("image")
+            if img:
+                with cols[i % 2]:
+                    if safe_image_exists(img):
+                        st.image(img, caption=f"Option {i+1}", use_container_width=True)
+                    else:
+                        st.warning(f"Missing image: {img}")
+
+    # Map selected label back to stored value
+    selected_idx = labels.index(selected_label)
+    chosen_obj = choices[selected_idx]
+
+    # If there is text, use text as the response value; else use image path.
+    selected_value = (chosen_obj.get("text") or "").strip()
+    if not selected_value:
+        selected_value = chosen_obj.get("image")
+
+    submitted = st.button("Submit Answer", key=f"submit_{q_index}_{q['id']}")
+    return selected_value, submitted
+
+
+def render_numeric(q, q_index):
+    st.markdown(f"### {q['prompt']}")
+    if q.get("image"):
+        if safe_image_exists(q["image"]):
+            st.image(q["image"], use_container_width=True)
+        else:
+            st.warning(f"Question image not found: {q['image']}")
+
+    inp_key = f"num_{q_index}_{q['id']}"
+    user_val = st.text_input("Your answer:", key=inp_key)
+    submitted = st.button("Submit Answer", key=f"submit_{q_index}_{q['id']}")
+    return user_val, submitted
+
+
+def get_user_response_widget(q, q_index):
+    q_type = q.get("type", "mcq")
+    if q_type == "mcq":
+        return render_mcq(q, q_index)
+    elif q_type == "numeric":
+        return render_numeric(q, q_index)
+    else:
+        st.error(f"Unsupported question type: {q_type}")
+        return None, False
+
+
+# ============================================================
+# Results + Analytics helpers
+# ============================================================
+
+def _parse_decimal_to_fraction(s: str):
     try:
-        import vl_convert as vlc  # type: ignore
-        spec = chart.to_dict()
-        png = vlc.vegalite_to_png(spec, scale=2)
-        return png
-    except Exception:
+        d = Decimal(s).normalize()
+        return Fraction(d)
+    except:
         return None
 
+def _parse_numeric(s: str):
+    s = (s or "").strip()
+    if not s:
+        return None
 
-def _build_charts_from_history(history_rows: list[dict]):
-    # Use Altair with inline data; no need for pandas to render in-app,
-    # but for PDF image export, Altair spec is enough.
-    base_data = alt.Data(values=history_rows)
+    # fraction like 3/4
+    if "/" in s:
+        try:
+            return Fraction(s)
+        except:
+            return None
 
-    domain_chart = (
-        alt.Chart(base_data)
-        .mark_bar()
-        .encode(
-            x=alt.X("domain:N", title="Domain", sort="-y"),
-            y=alt.Y("mean(correct):Q", title="Accuracy", scale=alt.Scale(domain=[0, 1])),
-            tooltip=["domain:N", alt.Tooltip("mean(correct):Q", title="Accuracy")]
-        )
-        .properties(width=520, height=220, title="Accuracy by Domain")
-    )
+    return _parse_decimal_to_fraction(s)
 
-    subtopic_chart = (
-        alt.Chart(base_data)
-        .mark_bar()
-        .encode(
-            x=alt.X("subtopic:N", title="Subtopic", sort="-y"),
-            y=alt.Y("mean(correct):Q", title="Accuracy", scale=alt.Scale(domain=[0, 1])),
-            tooltip=["subtopic:N", alt.Tooltip("mean(correct):Q", title="Accuracy")]
-        )
-        .properties(width=520, height=260, title="Accuracy by Subtopic")
-    )
-
-    return domain_chart, subtopic_chart
-
-
-def build_results_pdf_option_b(summary: dict) -> tuple[bytes | None, str | None]:
+def is_correct_response(q, user_response):
     """
-    Option B PDF: summary + question history + embedded charts as images.
-    Returns (pdf_bytes, error_message).
+    Handles:
+    - numeric equivalence (2 == 2.0 == 2.00)
+    - normal mcq string matching
+    """
+    if user_response is None:
+        return False
+
+    q_type = (q.get("type") or "").lower()
+
+    # --- Numeric type ---
+    if q_type == "numeric":
+        user_val = _parse_numeric(str(user_response))
+        correct_val = _parse_numeric(str(q.get("answer")))
+
+        if user_val is None or correct_val is None:
+            return False
+
+        return user_val == correct_val
+
+    # --- MCQ / default ---
+    a = str(q.get("answer", "")).strip()
+    u = str(user_response).strip()
+    return a == u
+
+def choice_label_for_value(q, value):
+    """
+    Converts an answer VALUE into a user-friendly label.
+    - If choices are dicts (image-based), show "Option N" (or explicit label if present).
+    - If choices are strings (normal MCQ), return the string itself.
+    """
+    if value is None:
+        return None
+
+    value_str = str(value).strip()
+    choices = q.get("choices")
+
+    # Image-choice format: choices is a list of dicts
+    if isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], dict):
+        for i, c in enumerate(choices):
+            # Support several possible keys to stay compatible with your JSON evolution
+            c_val = c.get("value", None)
+            if c_val is None:
+                c_val = c.get("image", None)
+            if c_val is None:
+                c_val = c.get("text", None)
+
+            if c_val is not None and str(c_val).strip() == value_str:
+                return c.get("label") or f"Option {i+1}"
+
+        # If not found, fallback to the raw value
+        return value_str
+
+    # Normal MCQ format: choices is a list of strings
+    return value_str
+
+
+
+def compute_summary(history):
+    total = len(history)
+    correct = sum(1 for h in history if h.get("correct"))
+    incorrect = total - correct
+    accuracy = (correct / total) if total else 0.0
+    return {
+        "total": total,
+        "correct": correct,
+        "incorrect": incorrect,
+        "accuracy": accuracy,
+    }
+
+
+def build_charts(history):
+    """
+    Returns list of chart dicts:
+      {"title":..., "fig": matplotlib_figure}
+    """
+    charts = []
+    if not history:
+        return charts
+
+    # ----------------------------
+    # Accuracy by difficulty
+    # ----------------------------
+    by_diff = {}
+    for h in history:
+        d = h.get("difficulty")
+        if d is None:
+            continue
+        by_diff.setdefault(d, {"n": 0, "c": 0})
+        by_diff[d]["n"] += 1
+        if h.get("correct"):
+            by_diff[d]["c"] += 1
+
+    diffs = sorted(by_diff.keys())
+    accs = [(by_diff[d]["c"] / by_diff[d]["n"]) for d in diffs]
+
+    fig1 = plt.figure()
+    plt.plot(diffs, accs, marker="o")
+    plt.xlabel("Difficulty")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
+    plt.title("Accuracy by Difficulty")
+    charts.append({"title": "Accuracy by Difficulty", "fig": fig1})
+
+    # ----------------------------
+    # Accuracy by domain  ✅ restored
+    # ----------------------------
+    by_domain = {}
+    for h in history:
+        dom = h.get("domain", "Unknown")
+        by_domain.setdefault(dom, {"n": 0, "c": 0})
+        by_domain[dom]["n"] += 1
+        if h.get("correct"):
+            by_domain[dom]["c"] += 1
+
+    domains_sorted = sorted(by_domain.keys())
+    dom_accs = [(by_domain[d]["c"] / by_domain[d]["n"]) for d in domains_sorted]
+
+    fig2 = plt.figure()
+    plt.bar(domains_sorted, dom_accs)
+    plt.xlabel("Domain")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
+    plt.title("Accuracy by Domain")
+    plt.xticks(rotation=25, ha="right")
+    charts.append({"title": "Accuracy by Domain", "fig": fig2})
+
+     # ----------------------------
+    # ✅ Accuracy by subtopic (ONE CHART PER DOMAIN)
+    # ----------------------------
+    # Structure: by_dom_sub[domain][subtopic] = {"n":..., "c":...}
+    by_dom_sub = {}
+    for h in history:
+        dom = h.get("domain", "Unknown")
+        sub = h.get("subtopic", "Unknown")
+        by_dom_sub.setdefault(dom, {})
+        by_dom_sub[dom].setdefault(sub, {"n": 0, "c": 0})
+        by_dom_sub[dom][sub]["n"] += 1
+        if h.get("correct"):
+            by_dom_sub[dom][sub]["c"] += 1
+
+    for dom in sorted(by_dom_sub.keys()):
+        subtopics = sorted(by_dom_sub[dom].keys())
+        # If you want to hide a domain chart when there's only 1 subtopic attempted, uncomment:
+        # if len(subtopics) < 2:
+        #     continue
+
+        sub_accs = []
+        for s in subtopics:
+            n = by_dom_sub[dom][s]["n"]
+            c = by_dom_sub[dom][s]["c"]
+            sub_accs.append(c / n if n else 0)
+
+        fig = plt.figure()
+        plt.bar(subtopics, sub_accs)
+        plt.xlabel("Subtopic")
+        plt.ylabel("Accuracy")
+        plt.ylim(0, 1)
+        plt.title(f"Accuracy by Subtopic — {dom}")
+        plt.xticks(rotation=25, ha="right")
+
+        charts.append({"title": f"Accuracy by Subtopic — {dom}", "fig": fig})
+
+    return charts
+
+# ============================================================
+# PDF Export (fixed)
+# ============================================================
+def generate_results_pdf(summary, history, charts):
+    """
+    Returns: (pdf_bytes, error_message)
     """
     try:
-        from reportlab.lib.pagesizes import letter
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+
+        x_margin = 50
+        y = height - 50
+
+        def line(text, dy=16, font="Helvetica", size=11):
+            nonlocal y
+            c.setFont(font, size)
+            c.drawString(x_margin, y, text)
+            y -= dy
+
+        # Title
+        line("SAT Math Practice — Results Report", dy=24, font="Helvetica-Bold", size=16)
+        line(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", dy=20)
+
+        # Summary
+        line("Summary", dy=18, font="Helvetica-Bold", size=14)
+        line(f"Total questions: {summary['total']}")
+        line(f"Correct: {summary['correct']}")
+        line(f"Incorrect: {summary['incorrect']}")
+        line(f"Accuracy: {summary['accuracy']*100:.1f}%")
+
+        y -= 10
+
+        # Charts: render each fig to PNG bytes, then drawImage via ImageReader
         from reportlab.lib.utils import ImageReader
-        from reportlab.pdfgen import canvas
+
+        for ch in charts:
+            # new page if needed
+            if y < 280:
+                c.showPage()
+                y = height - 50
+
+            line(ch["title"], dy=18, font="Helvetica-Bold", size=13)
+
+            img_buf = io.BytesIO()
+            ch["fig"].savefig(img_buf, format="png", bbox_inches="tight", dpi=150)
+            img_buf.seek(0)
+
+            img_reader = ImageReader(img_buf)
+            # Fit into page width
+            img_w = width - 2 * x_margin
+            img_h = 220
+            c.drawImage(img_reader, x_margin, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True)
+            y -= (img_h + 20)
+
+        # Question history
+        if y < 200:
+            c.showPage()
+            y = height - 50
+
+        line("Question History", dy=18, font="Helvetica-Bold", size=14)
+        for i, h in enumerate(history, start=1):
+            status = "Correct" if h.get("correct") else "Incorrect"
+            dom = h.get("domain", "")
+            sub = h.get("subtopic", "")
+            diff = h.get("difficulty", "")
+            qid = h.get("id", "")
+
+            # Wrap to next page if low
+            if y < 90:
+                c.showPage()
+                y = height - 50
+                line("Question History (cont.)", dy=18, font="Helvetica-Bold", size=14)
+
+            line(f"{i}. [{status}] {dom} | {sub} | Diff {diff}", dy=14)
+            if qid:
+                line(f"    ID: {qid}", dy=14)
+
+        c.save()
+        pdf_bytes = buffer.getvalue()
+        buffer.close()
+        return pdf_bytes, None
+
     except Exception as e:
-        return None, f"reportlab not installed: {e}"
-
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
-
-    x = 50
-    y = height - 50
-
-    def line(txt, dy=16, font="Helvetica", size=11):
-        nonlocal y
-        c.setFont(font, size)
-        c.drawString(x, y, txt)
-        y -= dy
-        if y < 60:
-            c.showPage()
-            y = height - 50
-
-    def spacer(dy=12):
-        nonlocal y
-        y -= dy
-        if y < 60:
-            c.showPage()
-            y = height - 50
-
-    c.setTitle("SAT Math Practice Results")
-
-    # Header
-    line("SAT Math Practice Results", dy=24, font="Helvetica-Bold", size=18)
-    line(f"Date: {summary['date']}")
-    line(f"Mode: {summary['mode']}")
-    line(f"Score: {summary['score']} / {summary['total']}")
-    line(f"Domains: {', '.join(summary['domains']) if summary['domains'] else 'All'}")
-    line(f"Subtopics: {', '.join(summary['subtopics']) if summary['subtopics'] else 'All'}")
-    line(f"Difficulty range: {summary['difficulty_min']} - {summary['difficulty_max']}")
-    if summary.get("seconds_per_question") is not None:
-        line(f"Seconds per question: {summary['seconds_per_question']}")
-
-    spacer(10)
-
-    # Build history rows for charts
-    history = summary.get("history", [])
-    history_rows = []
-    for h in history:
-        history_rows.append({
-            "domain": h.get("domain", "Unknown"),
-            "subtopic": h.get("subtopic", "Unknown"),
-            "difficulty": int(h.get("difficulty", 1)),
-            "correct": 1 if h.get("correct", False) else 0,
-        })
-
-    # Charts (if conversion works)
-    domain_chart_png = None
-    subtopic_chart_png = None
-    if history_rows:
-        domain_chart, subtopic_chart = _build_charts_from_history(history_rows)
-        domain_chart_png = _try_make_altair_png(domain_chart)
-        subtopic_chart_png = _try_make_altair_png(subtopic_chart)
-
-    if domain_chart_png and subtopic_chart_png:
-        # Embed charts
-        line("Performance Charts", dy=18, font="Helvetica-Bold", size=14)
-        spacer(6)
-
-        # Domain chart
-        img1 = ImageReader(BytesIO(domain_chart_png))
-        # drawImage(x, y, width, height) uses bottom-left origin, so compute placement carefully
-        chart_w = 520
-        chart_h = 220
-        y -= chart_h
-        c.drawImage(img1, x, y, width=chart_w, height=chart_h, preserveAspectRatio=True, mask="auto")
-        spacer(20)
-
-        # Subtopic chart
-        img2 = ImageReader(BytesIO(subtopic_chart_png))
-        chart_w2 = 520
-        chart_h2 = 260
-        y -= chart_h2
-        if y < 60:
-            c.showPage()
-            y = height - 50
-            y -= chart_h2
-        c.drawImage(img2, x, y, width=chart_w2, height=chart_h2, preserveAspectRatio=True, mask="auto")
-        spacer(30)
-    else:
-        # If charts couldn't be generated, tell them why
-        line("Performance Charts", dy=18, font="Helvetica-Bold", size=14)
-        line("Charts could not be embedded (missing chart-to-PNG converter).")
-        line("Install: pip install vl-convert-python")
-        spacer(10)
-
-    # Question history
-    line("Question History", dy=18, font="Helvetica-Bold", size=14)
-
-    for i, h in enumerate(history, start=1):
-        status = "Correct" if h.get("correct") else "Incorrect"
-        dom = h.get("domain", "")
-        sub = h.get("subtopic", "")
-        diff = h.get("difficulty", "")
-        qid = h.get("id", "")
-        difficulty_labels = {
-            1: "Very Easy",
-            2: "Easy",
-            3: "Medium",
-            4: "Hard",
-            5: "Very Hard"
-        }
-        label = difficulty_labels.get(int(diff), str(diff))
-        line(f"{i}. [{status}] {dom} | {sub} | Difficulty: {label} ({diff}/5) ", dy=14)
-        if qid:
-            line(f"    ID: {qid}", dy=14)
-
-    c.save()
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    return pdf_bytes, None
+        return None, str(e)
 
 
-# ----------------------------
-# Session state init
-# ----------------------------
-def init_state():
-    defaults = {
-        "in_quiz": False,
-        "quiz_started": False,
-        "quiz_questions": [],
-        "current_index": 0,
-        "score": 0,
-        "history": [],
-        "question_start_time": None,
-        "submitted_for_index": None,
-        "last_result": None,
-        "last_explanation": None,
-        "last_correct_answer": None,
-        "last_user_answer": None,
-        "selected_domains": None,
-        "selected_subtopics": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+# ============================================================
+# Timed mode: per-question timer (fixed)
+# ============================================================
+def init_timer(seconds_per_q: int):
+    st.session_state.time_per_question = int(seconds_per_q)
+    st.session_state.q_start_time = time.time()
 
 
-def reset_quiz_state(keep_filters=True):
-    st.session_state.in_quiz = False
+def time_left():
+    t0 = st.session_state.get("q_start_time", None)
+    per = st.session_state.get("time_per_question", None)
+    if t0 is None or per is None:
+        return None
+    elapsed = time.time() - t0
+    remaining = int(per - elapsed)
+    return max(0, remaining)
+
+
+def tick_timer_ui():
+    """
+    Just DISPLAY the timer (no sleep, no rerun).
+    We'll trigger reruns at the VERY END of the page render so the question shows.
+    """
+    remaining = time_left()
+    if remaining is None:
+        return
+    st.markdown(f"**Time remaining: {remaining} seconds**")
+
+
+# ============================================================
+# App state init
+# ============================================================
+if "mode" not in st.session_state:
+    st.session_state.mode = "Practice"
+
+if "quiz_started" not in st.session_state:
     st.session_state.quiz_started = False
-    st.session_state.quiz_questions = []
+
+if "current_index" not in st.session_state:
     st.session_state.current_index = 0
-    st.session_state.score = 0
+
+if "history" not in st.session_state:
     st.session_state.history = []
-    st.session_state.question_start_time = None
-    st.session_state.submitted_for_index = None
-    st.session_state.last_result = None
-    st.session_state.last_explanation = None
-    st.session_state.last_correct_answer = None
-    st.session_state.last_user_answer = None
-    if not keep_filters:
-        st.session_state.selected_domains = None
-        st.session_state.selected_subtopics = None
+
+if "quiz_questions" not in st.session_state:
+    st.session_state.quiz_questions = []
+
+if "submitted_current" not in st.session_state:
+    st.session_state.submitted_current = False
+
+if "last_feedback" not in st.session_state:
+    st.session_state.last_feedback = None
 
 
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-init_state()
+# ============================================================
+# Sidebar settings
+# ============================================================
+st.sidebar.title("Settings")
 
-st.title(APP_TITLE)
+mode = st.sidebar.radio("Mode", ["Practice", "Timed Quiz"], index=0 if st.session_state.mode == "Practice" else 1)
+st.session_state.mode = mode
 
-# Load questions
-try:
-    questions_all = load_questions(QUESTION_FILE)
-except Exception as e:
-    st.error(f"Failed to load {QUESTION_FILE}: {e}")
-    st.stop()
+# Load questions file
+QUESTIONS_PATH = "question_bank.json"
+questions_all = load_questions(QUESTIONS_PATH)
 
-all_domains = sorted({str(q.get("domain", "Unknown")) for q in questions_all})
-all_subtopics = sorted({str(q.get("subtopic", "Unknown")) for q in questions_all})
+domains = sorted(list({q["domain"] for q in questions_all}))
+subtopics = sorted(list({q["subtopic"] for q in questions_all}))
 
-with st.sidebar:
-    st.header("Settings")
+selected_domains = st.sidebar.multiselect("Select Domain(s)", domains, default=domains[:])
+selected_subtopics = st.sidebar.multiselect("Select Subtopic(s)", subtopics, default=subtopics[:])
 
-    mode = st.radio("Mode", ["Practice", "Timed Quiz"], index=0)
+diff_min, diff_max = st.sidebar.slider("Difficulty range (1–5)", 1, 5, (1, 5))
+num_questions = st.sidebar.number_input("Number of Questions", min_value=1, max_value=50, value=12, step=1)
 
-    # Default ALL selected
-    if st.session_state.selected_domains is None:
-        st.session_state.selected_domains = all_domains.copy()
-    if st.session_state.selected_subtopics is None:
-        st.session_state.selected_subtopics = all_subtopics.copy()
-
-    selected_domains = st.multiselect(
-        "Select Domain(s)",
-        options=all_domains,
-        default=st.session_state.selected_domains,
+# Timed settings: restored + working
+seconds_per_question = None
+if mode == "Timed Quiz":
+    seconds_per_question = st.sidebar.number_input(
+        "Seconds per question",
+        min_value=10,
+        max_value=600,
+        value=int(st.session_state.get("time_per_question", 60)),
+        step=5,
     )
-    st.session_state.selected_domains = selected_domains
 
-    selected_subtopics = st.multiselect(
-        "Select Subtopic(s)",
-        options=all_subtopics,
-        default=st.session_state.selected_subtopics,
-    )
-    st.session_state.selected_subtopics = selected_subtopics
+# Filter questions
+filtered = [
+    q for q in questions_all
+    if q["domain"] in selected_domains
+    and q["subtopic"] in selected_subtopics
+    and diff_min <= int(q.get("difficulty", 1)) <= diff_max
+]
 
-    diff_min, diff_max = st.slider("Difficulty range (1–5)", 1, 5, (1, 5))
-    num_questions = st.number_input("Number of Questions", min_value=1, max_value=100, value=10, step=1)
+st.sidebar.caption(f"Questions available with filters: {len(filtered)}")
 
-    seconds_per_question = None
-    if mode == "Timed Quiz":
-        seconds_per_question = st.number_input("Seconds per question", min_value=10, max_value=300, value=60, step=5)
+start = st.sidebar.button("Start Quiz")
+reset = st.sidebar.button("Reset / Back to Settings")
 
-    # Filter questions
-    filtered_questions = []
-    for q in questions_all:
-        d = str(q.get("domain", "Unknown"))
-        s = str(q.get("subtopic", "Unknown"))
-        diff = int(q.get("difficulty", 1))
+if reset:
+    st.session_state.quiz_started = False
+    st.session_state.current_index = 0
+    st.session_state.history = []
+    st.session_state.quiz_questions = []
+    st.session_state.submitted_current = False
+    st.session_state.last_feedback = None
+    if "q_start_time" in st.session_state:
+        del st.session_state.q_start_time
 
-        domain_ok = (len(selected_domains) == 0) or (d in selected_domains)
-        sub_ok = (len(selected_subtopics) == 0) or (s in selected_subtopics)
-        diff_ok = (diff_min <= diff <= diff_max)
+if start:
+    st.session_state.quiz_started = True
+    st.session_state.current_index = 0
+    st.session_state.history = []
+    st.session_state.submitted_current = False
+    st.session_state.last_feedback = None
 
-        if domain_ok and sub_ok and diff_ok:
-            filtered_questions.append(q)
+    # Choose questions
+    if len(filtered) == 0:
+        st.sidebar.error("No questions match your filters.")
+        st.session_state.quiz_started = False
+    else:
+        st.session_state.quiz_questions = random.sample(filtered, k=min(int(num_questions), len(filtered)))
 
-    st.caption(f"Questions available with filters: {len(filtered_questions)}")
-
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("Start Quiz", use_container_width=True):
-            if len(filtered_questions) == 0:
-                st.warning("No questions match your filters.")
-            else:
-                k = min(int(num_questions), len(filtered_questions))
-                st.session_state.quiz_questions = random.sample(filtered_questions, k=k)
-
-                st.session_state.in_quiz = True
-                st.session_state.quiz_started = True
-                st.session_state.current_index = 0
-                st.session_state.score = 0
-                st.session_state.history = []
-                st.session_state.submitted_for_index = None
-                st.session_state.last_result = None
-                st.session_state.last_explanation = None
-                st.session_state.last_correct_answer = None
-                st.session_state.last_user_answer = None
-                st.session_state.question_start_time = time.time() if mode == "Timed Quiz" else None
-
-                st.rerun()
-
-    with colB:
-        if st.button("Reset / Back to Settings", use_container_width=True):
-            reset_quiz_state(keep_filters=True)
-            st.rerun()
+        # Init timer if timed mode
+        if mode == "Timed Quiz":
+            init_timer(int(seconds_per_question))
 
 
-if not st.session_state.in_quiz:
-    st.subheader("How it works")
-    st.write(
-        "- Filters apply first (domain/subtopic/difficulty).\n"
-        "- Then we randomly choose your requested number of questions.\n"
-        "- Practice shows explanations after submit.\n"
-        "- Timed Quiz auto-submits when time runs out (no explanations)."
-    )
+# ============================================================
+# Main UI
+# ============================================================
+st.title("SAT Math Practice")
+
+if not st.session_state.quiz_started:
+    st.info("Choose your settings on the left and click **Start Quiz**.")
     st.stop()
 
 quiz = st.session_state.quiz_questions
 idx = st.session_state.current_index
 
-# Finished
 if idx >= len(quiz):
-    st.success(f"Complete! Final Score: {st.session_state.score} / {len(quiz)}")
+    st.success("Quiz complete!")
 
-    st.subheader("Performance Dashboard")
+    summary = compute_summary(st.session_state.history)
+    st.subheader("Results")
+    st.write(summary)
 
-    if len(st.session_state.history) > 0:
-        rows = []
-        for h in st.session_state.history:
-            rows.append({
-                "domain": h.get("domain", "Unknown"),
-                "subtopic": h.get("subtopic", "Unknown"),
-                "difficulty": int(h.get("difficulty", 1)),
-                "correct": 1 if h.get("correct", False) else 0
-            })
-
-        domain_chart = (
-            alt.Chart(alt.Data(values=rows))
-            .mark_bar()
-            .encode(
-                x=alt.X("domain:N", title="Domain", sort="-y"),
-                y=alt.Y("mean(correct):Q", title="Accuracy", scale=alt.Scale(domain=[0, 1])),
-            )
-        )
-        st.write("Accuracy by Domain")
-        st.altair_chart(domain_chart, use_container_width=True)
-
-        subtopic_chart = (
-            alt.Chart(alt.Data(values=rows))
-            .mark_bar()
-            .encode(
-                x=alt.X("subtopic:N", title="Subtopic", sort="-y"),
-                y=alt.Y("mean(correct):Q", title="Accuracy", scale=alt.Scale(domain=[0, 1])),
-            )
-        )
-        st.write("Accuracy by Subtopic")
-        st.altair_chart(subtopic_chart, use_container_width=True)
+    charts = build_charts(st.session_state.history)
+    for ch in charts:
+        st.pyplot(ch["fig"])
 
     st.subheader("Export")
-
-    export_summary = {
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "mode": mode,
-        "score": st.session_state.score,
-        "total": len(quiz),
-        "domains": st.session_state.selected_domains or [],
-        "subtopics": st.session_state.selected_subtopics or [],
-        "difficulty_min": diff_min,
-        "difficulty_max": diff_max,
-        "seconds_per_question": seconds_per_question,
-        "history": st.session_state.history,
-    }
-
-    pdf_bytes, pdf_error = build_results_pdf_option_b(export_summary)
-
-    if pdf_bytes:
+    pdf_bytes, pdf_err = generate_results_pdf(summary, st.session_state.history, charts)
+    if pdf_err:
+        st.error(f"PDF export error: {pdf_err}")
+    else:
         st.download_button(
-            "Download Results PDF (with charts)",
+            "Download PDF Report",
             data=pdf_bytes,
-            file_name="sat_math_results.pdf",
+            file_name="sat_math_results_report.pdf",
             mime="application/pdf",
         )
-        st.caption("If charts are missing, install: pip install vl-convert-python")
-    else:
-        st.warning(
-            "PDF export needs: pip install reportlab vl-convert-python\n"
-            "Then restart Streamlit."
-        )
-        if pdf_error:
-            st.caption(f"PDF error: {pdf_error}")
 
     st.stop()
 
-
-# Current question
 q = quiz[idx]
 
-q_domain = str(q.get("domain", "Unknown"))
-q_subtopic = str(q.get("subtopic", "Unknown"))
-q_diff = int(q.get("difficulty", 1))
-q_prompt = str(q.get("prompt", ""))
-q_explanation = q.get("explanation", None)
-q_image = q.get("image", None)
-q_type = str(q.get("type", "mcq")).lower()
-
-st.markdown(f"### Question {idx + 1} of {len(quiz)}")
-st.caption(f"Domain: {q_domain} | Subtopic: {q_subtopic} | Difficulty: {q_diff} | Type: {q_type}")
-st.subheader(q_prompt)
-
-if isinstance(q_image, str) and q_image.strip():
-    try:
-        st.image(q_image, use_container_width=True)
-    except Exception:
-        st.warning(f"Couldn't load image: {q_image}")
-
-user_response = get_user_response_widget(q, idx)
+st.markdown(f"## Question {idx+1} of {len(quiz)}")
+st.caption(f"Domain: {q['domain']} | Subtopic: {q['subtopic']} | Difficulty: {q['difficulty']}")
 
 
-# Practice mode
-if mode == "Practice":
-    submit_clicked = st.button("Submit Answer", key=f"submit_{idx}")
-
-    if submit_clicked and st.session_state.submitted_for_index != idx:
-        correct = is_correct(q, user_response)
-        if correct:
-            st.session_state.score += 1
-
-        st.session_state.history.append({
-            "id": q.get("id", ""),
-            "domain": q_domain,
-            "subtopic": q_subtopic,
-            "difficulty": q_diff,
-            "correct": correct,
-        })
-
-        st.session_state.submitted_for_index = idx
-        st.session_state.last_result = correct
-        st.session_state.last_correct_answer = str(q.get("answer", "")).strip()
-        st.session_state.last_user_answer = "" if user_response is None else str(user_response).strip()
-        st.session_state.last_explanation = str(q_explanation) if q_explanation is not None else None
-        st.rerun()
-
-    if st.session_state.submitted_for_index == idx and st.session_state.last_result is not None:
-        if st.session_state.last_result:
-            st.success("Correct! 🎉")
-        else:
-            st.error(f"Incorrect. Correct answer: {st.session_state.last_correct_answer}")
-
-        if st.session_state.last_explanation:
-            st.info(f"Explanation: {st.session_state.last_explanation}")
-
-        if st.button("Next Question", key=f"next_{idx}"):
-            st.session_state.current_index += 1
-            st.session_state.submitted_for_index = None
-            st.session_state.last_result = None
-            st.session_state.last_explanation = None
-            st.session_state.last_correct_answer = None
-            st.session_state.last_user_answer = None
-            st.session_state.question_start_time = time.time() if mode == "Timed Quiz" else None
-            st.rerun()
-
-    st.stop()
-
-
-# Timed Quiz mode
+# Timer UI (working)
 if mode == "Timed Quiz":
-    if st.session_state.question_start_time is None:
-        st.session_state.question_start_time = time.time()
+    
+    # --- Initialize timer ONLY once per question ---
+    current_qid = q.get("id",f"idx_{idx}")
+    if st.session_state.get("timer_qid") != current_qid:
+        init_timer(int(st.session_state.get("time_per_question",60)))
+        st.session_state.timer_qid = current_qid
+    # Show updating timer
+    tick_timer_ui()
+    # ✅ ADD THIS BLOCK RIGHT HERE (do not put it anywhere else)
+    remaining = time_left()
+    if (
+        remaining is not None
+        and remaining > 0
+        and not st.session_state.get("submitted_current", False)
+    ):
+        st_autorefresh(interval=1000, key=f"timer_refresh_{current_qid}")
 
-    elapsed = int(time.time() - st.session_state.question_start_time)
-    remaining = int(seconds_per_question) - elapsed
-    if remaining < 0:
-        remaining = 0
 
-    if HAS_AUTOREFRESH and remaining > 0 and st.session_state.submitted_for_index != idx:
-        st_autorefresh(interval=1000, key=f"refresh_{idx}")
-
-    st.warning(f"Time remaining: {remaining} seconds")
-
-    submit_now = st.button("Submit Now", key=f"submit_now_{idx}")
-    time_up = (remaining <= 0)
-
-    if (time_up or submit_now) and st.session_state.submitted_for_index != idx:
-        correct = is_correct(q, user_response)
-        if correct:
-            st.session_state.score += 1
-
+    # If time expired and not submitted, auto-mark incorrect and advance
+    if time_left() == 0 and not st.session_state.submitted_current:
+        # Auto-submit as blank
+        user_response = ""
+        correct = False
         st.session_state.history.append({
-            "id": q.get("id", ""),
-            "domain": q_domain,
-            "subtopic": q_subtopic,
-            "difficulty": q_diff,
-            "correct": correct,
+            "id": q.get("id"),
+            "domain": q.get("domain"),
+            "subtopic": q.get("subtopic"),
+            "difficulty": q.get("difficulty"),
+            "correct": False,
+            "user_response": user_response,
+            "answer": q.get("answer"),
         })
+        st.session_state.last_feedback = {
+            "correct": False,
+            "message": "Time's up!",
+            "correct_label": None,
+        }
+        st.session_state.submitted_current = True
 
-        st.session_state.submitted_for_index = idx
+# Question widget
+user_response, submitted = get_user_response_widget(q, idx)
 
-        # Auto-advance
+# Handle submission
+if submitted and not st.session_state.submitted_current:
+    correct = is_correct_response(q, user_response)
+
+    st.session_state.history.append({
+        "id": q.get("id"),
+        "domain": q.get("domain"),
+        "subtopic": q.get("subtopic"),
+        "difficulty": q.get("difficulty"),
+        "correct": correct,
+        "user_response": user_response,
+        "answer": q.get("answer"),
+    })
+
+    # Build better feedback for image answers (show "Option X" and/or display the image)
+    correct_choice_label = None
+    if q.get("type") == "mcq":
+        raw_choices = q.get("choices") or []
+        choices_norm = [normalize_choice(c) for c in raw_choices]
+        correct_idx = find_correct_choice_index(choices_norm, q.get("answer"))
+        if correct_idx is not None:
+            correct_choice_label = build_choice_label(choices_norm[correct_idx], correct_idx)
+
+    st.session_state.last_feedback = {
+        "correct": correct,
+        "message": "Correct!" if correct else "Incorrect.",
+        "correct_label": correct_choice_label,
+        "correct_answer": choice_label_for_value(q,q.get("answer")),
+        "correct_choice_index": None if correct_choice_label is None else correct_choice_label,
+    }
+
+    st.session_state.submitted_current = True
+
+# Feedback block
+if st.session_state.submitted_current and st.session_state.last_feedback:
+    fb = st.session_state.last_feedback
+    if fb["correct"]:
+        st.success(fb["message"])
+    else:
+        # If image-based correct answer, show label + image if available
+        if fb.get("correct_label"):
+            st.error(f"{fb['message']} Correct answer: **{fb['correct_label']}**")
+        else:
+            st.error(f"{fb['message']} Correct answer: **{q.get('answer')}**")
+
+        # If the correct answer is an image path, display it to make it unambiguous
+        ans = q.get("answer")
+        if isinstance(ans, str) and ans.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            if safe_image_exists(ans):
+                st.image(ans, caption="Correct answer image", use_container_width=True)
+
+    st.info(f"Explanation: {q.get('explanation','')}")
+
+    if st.button("Next Question"):
         st.session_state.current_index += 1
-        st.session_state.question_start_time = time.time()
-        st.session_state.submitted_for_index = None
-        st.rerun()
+        st.session_state.submitted_current = False
+        st.session_state.last_feedback = None
 
-    st.stop()
+        # Reset timer for next question in timed mode
+        if mode == "Timed Quiz":
+            init_timer(int(st.session_state.get("time_per_question", 60)))
+
+        st.rerun()
+    # --- Timed mode live refresh (rerun AFTER rendering the page) ---
+    if mode == "Timed Quiz":
+        remaining = time_left()
+        if remaining is not None and remaining > 0 and not st.session_state.get("submitted_current", False):
+            time.sleep(0.25)
+            st.rerun()
