@@ -2587,7 +2587,7 @@
         "domain": "Advanced Math",
         "subtopic": "Nonlinear equations and functions",
         "difficulty": 4,
-        "prompt": "A biologist models the average daily food intake F (in pounds) of a large plant-eating mammal with body weight x (in pounds) using the function\n\n$$\nF = 0.3x^{3/4}.\n$$\n\nIf an animal consumes 300 pounds of food per day, approximately what is its body weight?",
+        "prompt": "A biologist models the average daily food intake $F$ (in pounds) of a large plant-eating mammal with body weight $x$ (in pounds) using the function $F = 0.3x^{3/4}$. If an animal consumes $300$ pounds of food per day, approximately what is its body weight?",
         "image": null,
         "choices": [
           "1,000 lb",
@@ -2595,8 +2595,8 @@
           "100,000 lb",
           "1,000,000 lb"
         ],
-        "answer": "100,000 lb",
-        "explanation": "Set 300 = 0.3x^{3/4}. Divide both sides by 0.3:\n\n$$\n1000 = x^{3/4}.\n$$\n\nRaise both sides to the 4/3 power:\n\n$$\nx = 1000^{4/3} = (10^3)^{4/3} = 10^4 = 100,000.\n$$"
+        "answer": "10,000 lb",
+        "explanation": "Set $300 = 0.3x^{3/4}$. Divide both sides by $0.3$ to get $1000 = x^{3/4}$. Raise both sides to the $\\frac{4}{3}$ power: $x = 1000^{4/3} = (10^3)^{4/3} = 10^4 = 10{,}000$. Therefore, the body weight is approximately $10{,}000$ pounds."
       },
       {
         "id": "AM-LE-229",
