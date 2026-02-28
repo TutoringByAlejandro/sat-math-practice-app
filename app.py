@@ -18,10 +18,15 @@ from reportlab.lib.pagesizes import letter
 import matplotlib.pyplot as plt
 
 
+
 # ============================================================
 # Config
 # ============================================================
 st.set_page_config(page_title="SAT Math Practice", layout="wide")
+
+
+
+
 
 st.markdown("""
 <style>
@@ -33,8 +38,9 @@ div[role="radiogroup"] > label {
 # ============================================================
 # Load questions
 # ============================================================
-@st.cache_data
-def load_questions(path: str):
+@st.cache_data(show_spinner=False)
+def load_questions(path: str, file_sig: tuple[int, int]):
+    # file_sig = (mtime_ns, size)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -573,14 +579,44 @@ mode = st.sidebar.radio("Mode", ["Practice", "Timed Quiz"], index=0 if st.sessio
 st.session_state.mode = mode
 
 # Load questions file
+
 QUESTIONS_PATH = "question_bank.json"
-questions_all = load_questions(QUESTIONS_PATH)
+
+stat = os.stat(QUESTIONS_PATH)
+file_sig = (stat.st_mtime_ns, stat.st_size)
+
+questions_all = load_questions(QUESTIONS_PATH, file_sig)
+
+
 
 domains = sorted(list({q["domain"] for q in questions_all}))
 subtopics = sorted(list({q["subtopic"] for q in questions_all}))
 
-selected_domains = st.sidebar.multiselect("Select Domain(s)", domains, default=domains[:])
-selected_subtopics = st.sidebar.multiselect("Select Subtopic(s)", subtopics, default=subtopics[:])
+# --- Force filter widgets to have stable keys ---
+DOMAINS_KEY = "selected_domains_v2"
+SUBTOPICS_KEY = "selected_subtopics_v2"
+
+# One-click reset (clears stored widget state)
+if st.sidebar.button("Reset filters (select all)"):
+    st.session_state.pop(DOMAINS_KEY, None)
+    st.session_state.pop(SUBTOPICS_KEY, None)
+    st.rerun()
+
+selected_domains = st.sidebar.multiselect(
+    "Select Domain(s)",
+    domains,
+    default=domains,
+    key=DOMAINS_KEY
+)
+
+selected_subtopics = st.sidebar.multiselect(
+    "Select Subtopic(s)",
+    subtopics,
+    default=subtopics,
+    key=SUBTOPICS_KEY
+)
+
+
 
 diff_min, diff_max = st.sidebar.slider("Difficulty range (1–5)", 1, 5, (1, 5))
 num_questions = st.sidebar.number_input("Number of Questions", min_value=1, max_value=50, value=12, step=1)
